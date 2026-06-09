@@ -107,7 +107,7 @@
 <body>
 <header>
   <h1>Link<span>Circle</span></h1>
-  <p>上传圆点图 → 自动识别每个圆 → 计算遍历全部圆的最短路径（TSP：贪心近似 / 动态规划精确解）</p>
+  <p>上传圆点图 → 自动识别每个圆 → 计算遍历全部圆的最短路径（TSP：快速近似 / 精确最优）</p>
 </header>
 <main>
   <div id="stage">
@@ -133,7 +133,7 @@
         <label>求解算法</label>
         <select id="algo">
           <option value="approx">快速近似（最近邻 + 2-opt）</option>
-          <option value="exact">精确最优（Held-Karp 动态规划，≤ 20 个圆）</option>
+          <option value="exact">精确最优（保证最优解，点多时较慢）</option>
         </select>
       </div>
       <div class="row">
@@ -152,6 +152,7 @@
     <div class="card">
       <h2>结果</h2>
       <div id="stats"><span class="dim">还没有图片</span></div>
+      <button id="stopBtn" style="display:none; margin-top:12px">停止求解（保留当前最优）</button>
     </div>
   </aside>
 </main>
@@ -219,20 +220,21 @@ document.getElementById("closed").onchange = () => { if (sourceImage) run(); };
 document.getElementById("algo").onchange = () => { if (sourceImage) run(); };
 document.getElementById("showLabels").onchange = () => { if (sourceImage) render(order.length, false); };
 
-// ---------- 主流程 ----------
+// ---------- 主流程：圆识别在主线程，TSP 求解放在 Web Worker 里，不阻塞界面 ----------
 
-const MAX_EXACT = 20; // Held-Karp 是 O(n²·2ⁿ)，超过 20 个圆内存和耗时都不可行
+const stopBtn = document.getElementById("stopBtn");
+let worker = null;
+let solve = null; // 当前求解状态 {algo, closed, n, explored, lb, t0}
 
 let runTimer = 0;
 function run() {
-  // 先让"计算中"渲染出来，再做重计算；同时给滑杆拖动做防抖
+  // 先让"计算中"渲染出来；同时给滑杆拖动做防抖
   statsEl.innerHTML = '<span class="dim">计算中…</span>';
   clearTimeout(runTimer);
   runTimer = setTimeout(doRun, 30);
 }
 
 function doRun() {
-  const t0 = performance.now();
   ctx.drawImage(sourceImage, 0, 0);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
@@ -242,35 +244,96 @@ function doRun() {
     Number(document.getElementById("minArea").value)
   );
 
-  const closed = document.getElementById("closed").checked;
-  const wantExact = document.getElementById("algo").value === "exact";
-  const useExact = wantExact && circles.length <= MAX_EXACT;
-  ({ order, length: pathLength } = useExact
-    ? solveTSPExact(circles, closed)
-    : solveTSPApprox(circles, closed));
-
-  const elapsed = performance.now() - t0;
-  updateStats(elapsed, useExact, wantExact && !useExact);
+  if (worker) { worker.terminate(); worker = null; }
+  stopBtn.style.display = "none";
   downloadBtn.disabled = circles.length === 0;
-  animatePath();
-}
+  order = [];
+  pathLength = 0;
 
-function updateStats(elapsedMs, usedExact, fellBack) {
   if (circles.length === 0) {
     statsEl.innerHTML = '<span class="dim">没有识别到圆，试着调高灵敏度或调低最小面积</span>';
+    render(0, false);
     return;
   }
-  const algoNote = usedExact
-    ? '精确最优解（Held-Karp 动态规划）'
-    : 'TSP 是 NP-hard，这里用最近邻 + 2-opt 求近似最优解';
-  const fallbackNote = fellBack
-    ? `<br><span class="dim">圆超过 ${MAX_EXACT} 个，精确算法不可行，已自动改用快速近似</span>`
-    : '';
+
+  solve = {
+    algo: document.getElementById("algo").value,
+    closed: document.getElementById("closed").checked,
+    n: circles.length,
+    explored: 0,
+    lb: 0,
+    t0: performance.now()
+  };
+  worker = new Worker(workerURL);
+  worker.onmessage = onWorkerMessage;
+  worker.postMessage({
+    points: circles.map(c => ({ x: c.x, y: c.y })),
+    closed: solve.closed,
+    algo: solve.algo
+  });
+}
+
+function onWorkerMessage(e) {
+  const m = e.data;
+  if (m.type === "percent") {
+    statsEl.innerHTML =
+      `识别到圆：<b>${solve.n}</b> 个<br>` +
+      `正在精确求解（动态规划）… <b>${m.percent}</b>%`;
+  } else if (m.type === "tick") {
+    solve.explored = m.explored;
+    if (m.lb) solve.lb = m.lb;
+    renderSolvingStats();
+  } else if (m.type === "better") {
+    order = m.order;
+    pathLength = m.length;
+    render(order.length, false);
+    renderSolvingStats();
+    stopBtn.style.display = "block"; // 有可行解之后才能"停止并保留"
+  } else if (m.type === "done") {
+    worker.terminate();
+    worker = null;
+    stopBtn.style.display = "none";
+    order = m.order;
+    pathLength = m.length;
+    finishStats(m.optimal, m.method);
+    animatePath();
+  }
+}
+
+stopBtn.onclick = () => {
+  if (!worker) return;
+  worker.terminate();
+  worker = null;
+  stopBtn.style.display = "none";
+  finishStats(false);
+  animatePath();
+};
+
+function renderSolvingStats() {
+  const lbNote = solve.lb
+    ? `已证明下界：<b>${Math.round(solve.lb)}</b> px<br>`
+    : "";
   statsEl.innerHTML =
-    `识别到圆：<b>${circles.length}</b> 个<br>` +
+    `识别到圆：<b>${solve.n}</b> 个<br>` +
+    `正在精确求解（分支定界）…<br>` +
+    `当前最优：<b>${Math.round(pathLength)}</b> px<br>` +
+    lbNote +
+    `已探索：<b>${(solve.explored / 1e6).toFixed(1)}</b>M 个分支<br>` +
+    `<span class="dim">搜索完毕即证明最优，也可随时停止保留当前解</span>`;
+}
+
+function finishStats(optimal, method) {
+  const elapsed = performance.now() - solve.t0;
+  const note = solve.algo === "exact"
+    ? (optimal
+        ? `精确最优解（${method}，已证明最优）`
+        : "已停止，显示目前找到的最短路径（未证明最优）")
+    : "TSP 是 NP-hard，快速模式用最近邻 + 2-opt 求近似解";
+  statsEl.innerHTML =
+    `识别到圆：<b>${solve.n}</b> 个<br>` +
     `路径总长：<b>${Math.round(pathLength)}</b> px<br>` +
-    `计算耗时：<b>${elapsedMs.toFixed(0)}</b> ms<br>` +
-    `<span class="dim">${algoNote}</span>` + fallbackNote;
+    `计算耗时：<b>${elapsed < 10000 ? elapsed.toFixed(0) + " ms" : (elapsed / 1000).toFixed(1) + " s"}</b><br>` +
+    `<span class="dim">${note}</span>`;
 }
 
 // ---------- 圆识别：背景色估计 → 前景掩码 → 连通域 → 圆心/半径 ----------
@@ -341,140 +404,264 @@ function detectCircles(imageData, threshold, minArea) {
   return result;
 }
 
-// ---------- TSP 求解 ----------
+// ---------- TSP 求解（在 Web Worker 中运行，不阻塞界面） ----------
+// 近似：多起点最近邻 + 2-opt。
+// 精确：n ≤ 20 用 Held-Karp 动态规划（受 O(n·2ⁿ) 内存约束没法更大）；
+//       更多的点用分支定界（MST 下界剪枝），内存 O(n)，慢慢搜直到证明最优。
 
-function buildDist(points) {
-  const n = points.length;
-  const dist = new Float64Array(n * n);
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const d = Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y);
-      dist[i * n + j] = d;
-      dist[j * n + i] = d;
-    }
-  }
-  return dist;
-}
+function solverWorkerMain() {
+  "use strict";
 
-function tourLength(dist, n, ord, closed) {
-  let len = 0;
-  for (let i = 1; i < ord.length; i++) len += dist[ord[i - 1] * n + ord[i]];
-  if (closed) len += dist[ord[ord.length - 1] * n + ord[0]];
-  return len;
-}
-
-// 近似解：每个起点跑最近邻，取最优，再做 2-opt 优化
-function solveTSPApprox(points, closed) {
-  const n = points.length;
-  if (n === 0) return { order: [], length: 0 };
-  if (n === 1) return { order: [0], length: 0 };
-
-  const dist = buildDist(points);
-
-  // 最近邻：n 较小时尝试所有起点，较大时只试一部分，控制在 O(n^3) 以内
-  const starts = [];
-  const maxStarts = n <= 250 ? n : Math.max(1, Math.floor(250 * 250 / n));
-  for (let s = 0; s < n; s += Math.max(1, Math.floor(n / maxStarts))) starts.push(s);
-
-  let bestOrder = null, bestLen = Infinity;
-  const visited = new Uint8Array(n);
-  for (const s of starts) {
-    visited.fill(0);
-    const ord = [s];
-    visited[s] = 1;
-    let cur = s, len = 0;
-    for (let k = 1; k < n; k++) {
-      let next = -1, nd = Infinity;
-      const row = cur * n;
-      for (let j = 0; j < n; j++) {
-        if (!visited[j] && dist[row + j] < nd) { nd = dist[row + j]; next = j; }
-      }
-      ord.push(next);
-      visited[next] = 1;
-      len += nd;
-      cur = next;
-    }
-    if (closed) len += dist[cur * n + s];
-    if (len < bestLen) { bestLen = len; bestOrder = ord; }
-  }
-
-  // 2-opt：反转一段子路径，若总长变短则接受，循环到无改进或超时
-  const ord = bestOrder;
-  const deadline = performance.now() + 2000;
-  let improved = true;
-  while (improved && performance.now() < deadline) {
-    improved = false;
-    for (let i = 0; i < n - 1; i++) {
-      // 开放路径中 i=0 表示换起点（左侧没有边）；闭环时左邻是末尾节点
-      const a = i === 0 ? (closed ? ord[n - 1] : -1) : ord[i - 1];
+  function buildDist(points) {
+    const n = points.length;
+    const dist = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
-        if (closed && i === 0 && j === n - 1) continue;
-        const b = j === n - 1 ? (closed ? ord[0] : -1) : ord[j + 1];
-        const before = (a >= 0 ? dist[a * n + ord[i]] : 0) + (b >= 0 ? dist[ord[j] * n + b] : 0);
-        const after  = (a >= 0 ? dist[a * n + ord[j]] : 0) + (b >= 0 ? dist[ord[i] * n + b] : 0);
-        if (after < before - 1e-9) {
-          for (let l = i, r = j; l < r; l++, r--) {
-            const tmp = ord[l]; ord[l] = ord[r]; ord[r] = tmp;
+        const d = Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y);
+        dist[i * n + j] = d;
+        dist[j * n + i] = d;
+      }
+    }
+    return dist;
+  }
+
+  function tourLength(dist, n, ord, closed) {
+    let len = 0;
+    for (let i = 1; i < ord.length; i++) len += dist[ord[i - 1] * n + ord[i]];
+    if (closed) len += dist[ord[ord.length - 1] * n + ord[0]];
+    return len;
+  }
+
+  // 近似解：每个起点跑最近邻，取最优，再做 2-opt 优化
+  function approx(dist, n, closed, timeBudgetMs) {
+    // 最近邻：n 较小时尝试所有起点，较大时只试一部分，控制在 O(n^3) 以内
+    const starts = [];
+    const maxStarts = n <= 250 ? n : Math.max(1, Math.floor(250 * 250 / n));
+    for (let s = 0; s < n; s += Math.max(1, Math.floor(n / maxStarts))) starts.push(s);
+
+    let bestOrder = null, bestLen = Infinity;
+    const visited = new Uint8Array(n);
+    for (const s of starts) {
+      visited.fill(0);
+      const ord = [s];
+      visited[s] = 1;
+      let cur = s, len = 0;
+      for (let k = 1; k < n; k++) {
+        let next = -1, nd = Infinity;
+        const row = cur * n;
+        for (let j = 0; j < n; j++) {
+          if (!visited[j] && dist[row + j] < nd) { nd = dist[row + j]; next = j; }
+        }
+        ord.push(next);
+        visited[next] = 1;
+        len += nd;
+        cur = next;
+      }
+      if (closed) len += dist[cur * n + s];
+      if (len < bestLen) { bestLen = len; bestOrder = ord; }
+    }
+
+    // 2-opt：反转一段子路径，若总长变短则接受，循环到无改进或超时
+    const ord = bestOrder;
+    const deadline = performance.now() + timeBudgetMs;
+    let improved = true;
+    while (improved && performance.now() < deadline) {
+      improved = false;
+      for (let i = 0; i < n - 1; i++) {
+        // 开放路径中 i=0 表示换起点（左侧没有边）；闭环时左邻是末尾节点
+        const a = i === 0 ? (closed ? ord[n - 1] : -1) : ord[i - 1];
+        for (let j = i + 1; j < n; j++) {
+          if (closed && i === 0 && j === n - 1) continue;
+          const b = j === n - 1 ? (closed ? ord[0] : -1) : ord[j + 1];
+          const before = (a >= 0 ? dist[a * n + ord[i]] : 0) + (b >= 0 ? dist[ord[j] * n + b] : 0);
+          const after  = (a >= 0 ? dist[a * n + ord[j]] : 0) + (b >= 0 ? dist[ord[i] * n + b] : 0);
+          if (after < before - 1e-9) {
+            for (let l = i, r = j; l < r; l++, r--) {
+              const tmp = ord[l]; ord[l] = ord[r]; ord[r] = tmp;
+            }
+            improved = true;
           }
-          improved = true;
         }
       }
     }
+    return ord;
   }
 
-  return { order: ord, length: tourLength(dist, n, ord, closed) };
-}
+  // 精确解（小规模）：Held-Karp 动态规划，dp[mask][j] = 访问完 mask 中的点、停在 j 的最短长度
+  function heldKarp(dist, n, closed) {
+    const full = (1 << n) - 1;
+    const dp = new Float32Array((1 << n) * n).fill(Infinity);
+    const parent = new Int8Array((1 << n) * n).fill(-1);
 
-// 精确解：Held-Karp 动态规划，O(n²·2ⁿ)，dp[mask][j] = 访问完 mask 中的点、停在 j 的最短长度
-function solveTSPExact(points, closed) {
-  const n = points.length;
-  if (n === 0) return { order: [], length: 0 };
-  if (n === 1) return { order: [0], length: 0 };
+    // 闭环时路径起点可任取，固定为 0 号点；开放路径起点未知，每个点都可作起点
+    if (closed) dp[1 * n + 0] = 0;
+    else for (let j = 0; j < n; j++) dp[(1 << j) * n + j] = 0;
 
-  const dist = buildDist(points);
-  const full = (1 << n) - 1;
-  const dp = new Float32Array((1 << n) * n).fill(Infinity);
-  const parent = new Int8Array((1 << n) * n).fill(-1);
-
-  // 闭环时路径起点可任取，固定为 0 号点；开放路径起点未知，每个点都可作起点
-  if (closed) dp[1 * n + 0] = 0;
-  else for (let j = 0; j < n; j++) dp[(1 << j) * n + j] = 0;
-
-  for (let mask = 1; mask < full; mask++) {
-    const base = mask * n;
-    for (let j = 0; j < n; j++) {
-      const cur = dp[base + j];
-      if (cur === Infinity) continue;
-      const row = j * n;
-      for (let k = 0; k < n; k++) {
-        if (mask & (1 << k)) continue;
-        const cand = cur + dist[row + k];
-        const idx = (mask | (1 << k)) * n + k;
-        if (cand < dp[idx]) { dp[idx] = cand; parent[idx] = j; }
+    for (let mask = 1; mask < full; mask++) {
+      if ((mask & 0xFFFF) === 0) postMessage({ type: "percent", percent: Math.round(mask / full * 100) });
+      const base = mask * n;
+      for (let j = 0; j < n; j++) {
+        const cur = dp[base + j];
+        if (cur === Infinity) continue;
+        const row = j * n;
+        for (let k = 0; k < n; k++) {
+          if (mask & (1 << k)) continue;
+          const cand = cur + dist[row + k];
+          const idx = (mask | (1 << k)) * n + k;
+          if (cand < dp[idx]) { dp[idx] = cand; parent[idx] = j; }
+        }
       }
     }
+
+    // 终点：闭环取「回到 0 号点」总长最短的，开放路径取 dp 值最小的
+    let end = -1, best = Infinity;
+    for (let j = 0; j < n; j++) {
+      const v = dp[full * n + j] + (closed ? dist[j * n + 0] : 0);
+      if (v < best) { best = v; end = j; }
+    }
+
+    // 沿 parent 回溯出访问顺序
+    const ord = [];
+    let mask = full, j = end;
+    while (j >= 0) {
+      ord.push(j);
+      const p = parent[mask * n + j];
+      mask ^= 1 << j;
+      j = p;
+    }
+    ord.reverse();
+    return { order: ord, length: tourLength(dist, n, ord, closed) };
   }
 
-  // 终点：闭环取「回到 0 号点」总长最短的，开放路径取 dp 值最小的
-  let end = -1, best = Infinity;
-  for (let j = 0; j < n; j++) {
-    const v = dp[full * n + j] + (closed ? dist[j * n + 0] : 0);
-    if (v < best) { best = v; end = j; }
+  // 精确解（大规模）：分支定界。深度优先枚举访问顺序，
+  // 用「当前点 ∪ 未访问点 ∪ 起点」的最小生成树作为剩余路程的下界来剪枝，
+  // 找到的每个更优可行解都实时上报，搜完整棵树即证明最优。
+  function branchAndBound(dist, n, closed) {
+    // 开放路径转闭环：加一个到所有点距离为 0 的虚拟点，
+    // 经过虚拟点的最优闭环去掉虚拟点即为最优开放路径
+    const N = closed ? n : n + 1;
+    let D = dist;
+    if (!closed) {
+      D = new Float64Array(N * N);
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++) D[i * N + j] = dist[i * n + j];
+    }
+    const virtual = closed ? -1 : n;
+
+    const toResult = (cycle) => {
+      if (closed) return cycle.slice();
+      const i = cycle.indexOf(virtual);
+      return cycle.slice(i + 1).concat(cycle.slice(0, i));
+    };
+    const report = (type) => {
+      postMessage({
+        type, order: resOrder, length: tourLength(dist, n, resOrder, closed),
+        optimal: type === "done", method: "分支定界", explored
+      });
+    };
+
+    // 先用快速近似拿一个可行解作为初始上界，越紧剪枝越狠
+    let explored = 0;
+    let bestCycle = approx(D, N, true, 1500);
+    let best = tourLength(D, N, bestCycle, true);
+    let resOrder = toResult(bestCycle);
+    report("better");
+
+    const used = new Uint8Array(N);
+    const path = new Int32Array(N);
+    path[0] = 0; // 闭环对旋转不变，固定从 0 号点出发
+    used[0] = 1;
+
+    // Prim 算法求 MST，nodes/minE/inTree 复用避免频繁分配
+    const nodes = new Int32Array(N + 1);
+    const minE = new Float64Array(N + 1);
+    const inTree = new Uint8Array(N + 1);
+    function lowerBound(cur) {
+      let k = 0;
+      nodes[k++] = cur;
+      if (cur !== 0) nodes[k++] = 0;
+      for (let j = 0; j < N; j++) if (!used[j]) nodes[k++] = j;
+      if (k <= 1) return 0;
+      for (let i = 0; i < k; i++) { minE[i] = Infinity; inTree[i] = 0; }
+      minE[0] = 0;
+      let total = 0;
+      for (let it = 0; it < k; it++) {
+        let u = -1, m = Infinity;
+        for (let i = 0; i < k; i++) if (!inTree[i] && minE[i] < m) { m = minE[i]; u = i; }
+        inTree[u] = 1;
+        total += m;
+        const row = nodes[u] * N;
+        for (let i = 0; i < k; i++) {
+          if (inTree[i]) continue;
+          const w = D[row + nodes[i]];
+          if (w < minE[i]) minE[i] = w;
+        }
+      }
+      return total;
+    }
+
+    const rootLB = lowerBound(0);
+
+    // 预先把每个点的邻居按距离排好，DFS 中按近到远直接扫，免去每个节点的排序和分配
+    const nbr = new Int32Array(N * (N - 1));
+    {
+      const idx = Array.from({ length: N }, (_, i) => i);
+      for (let i = 0; i < N; i++) {
+        const sorted = idx.filter(j => j !== i).sort((a, b) => D[i * N + a] - D[i * N + b]);
+        nbr.set(sorted, i * (N - 1));
+      }
+    }
+
+    function dfs(cur, depth, cost) {
+      explored++;
+      if ((explored & 0x3FFFF) === 0) postMessage({ type: "tick", explored, lb: rootLB });
+      if (depth === N) {
+        const total = cost + D[cur * N]; // 收尾边：回到 0 号点
+        if (total < best - 1e-9) {
+          best = total;
+          resOrder = toResult(Array.from(path));
+          report("better");
+        }
+        return;
+      }
+      const row = cur * N, nbrBase = cur * (N - 1);
+      for (let t = 0; t < N - 1; t++) {
+        const j = nbr[nbrBase + t];
+        if (used[j]) continue;
+        const c = cost + D[row + j];
+        if (c >= best) continue;
+        used[j] = 1;
+        path[depth] = j;
+        if (c + lowerBound(j) < best - 1e-9) dfs(j, depth + 1, c);
+        used[j] = 0;
+      }
+    }
+    dfs(0, 1, 0);
+    report("done");
   }
 
-  // 沿 parent 回溯出访问顺序
-  const ord = [];
-  let mask = full, j = end;
-  while (j >= 0) {
-    ord.push(j);
-    const p = parent[mask * n + j];
-    mask ^= 1 << j;
-    j = p;
-  }
-  ord.reverse();
-
-  return { order: ord, length: tourLength(dist, n, ord, closed) };
+  onmessage = (e) => {
+    const { points, closed, algo } = e.data;
+    const n = points.length;
+    const dist = buildDist(points);
+    if (n <= 2) {
+      const ord = points.map((_, i) => i);
+      postMessage({ type: "done", order: ord, length: tourLength(dist, n, ord, closed), optimal: true, method: "枚举" });
+    } else if (algo !== "exact") {
+      const ord = approx(dist, n, closed, 2000);
+      postMessage({ type: "done", order: ord, length: tourLength(dist, n, ord, closed), optimal: false });
+    } else if (n <= 20) {
+      const r = heldKarp(dist, n, closed);
+      postMessage({ type: "done", order: r.order, length: r.length, optimal: true, method: "Held-Karp 动态规划" });
+    } else {
+      branchAndBound(dist, n, closed);
+    }
+  };
 }
+
+const workerURL = URL.createObjectURL(
+  new Blob(["(" + solverWorkerMain.toString() + ")()"], { type: "text/javascript" })
+);
 
 // ---------- 绘制与动画 ----------
 
