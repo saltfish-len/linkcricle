@@ -572,7 +572,70 @@ function solverWorkerMain() {
     path[0] = 0; // 闭环对旋转不变，固定从 0 号点出发
     used[0] = 1;
 
-    // Prim 算法求 MST，nodes/minE/inTree 复用避免频繁分配
+    // Held-Karp 拉格朗日下界：给每个点学一个惩罚 λᵢ，惩罚距离
+    // D'(i,j) = D(i,j) + λᵢ + λⱼ。任何环在 D' 下都包含一个
+    // 「V\{0} 的生成树 + 0 号点的两条边」（1-tree），且环上每点度数为 2，
+    // 故真实环长 ≥ 1-tree(D') − 2Σλ。注意不能用全图 MST 代替 1-tree：
+    // 环有 N 条边、生成树只有 N−1 条，λ 把边权推成负数后那个界会失效。
+    // 用次梯度上升（λᵢ 朝度数−2 的方向调）把下界推到最紧，搜索全程共用这组 λ。
+    const lambda = new Float64Array(N);
+    const mstDeg = new Int32Array(N);
+    const mstParent = new Int32Array(N);
+    const minEAll = new Float64Array(N);
+    const inTreeAll = new Uint8Array(N);
+    function oneTreeWithDegrees(lam) {
+      // V\{0} 上的 Prim MST
+      for (let i = 0; i < N; i++) { minEAll[i] = Infinity; inTreeAll[i] = 0; mstDeg[i] = 0; mstParent[i] = -1; }
+      minEAll[1] = 0;
+      let total = 0;
+      for (let it = 0; it < N - 1; it++) {
+        let u = -1, m = Infinity;
+        for (let i = 1; i < N; i++) if (!inTreeAll[i] && minEAll[i] < m) { m = minEAll[i]; u = i; }
+        inTreeAll[u] = 1;
+        total += m;
+        if (mstParent[u] > 0) { mstDeg[u]++; mstDeg[mstParent[u]]++; }
+        const row = u * N;
+        for (let i = 1; i < N; i++) {
+          if (inTreeAll[i]) continue;
+          const w = D[row + i] + lam[u] + lam[i];
+          if (w < minEAll[i]) { minEAll[i] = w; mstParent[i] = u; }
+        }
+      }
+      // 0 号点接上两条最便宜的惩罚边
+      let e1 = Infinity, e2 = Infinity, j1 = -1, j2 = -1;
+      for (let j = 1; j < N; j++) {
+        const w = D[j] + lam[0] + lam[j];
+        if (w < e1) { e2 = e1; j2 = j1; e1 = w; j1 = j; }
+        else if (w < e2) { e2 = w; j2 = j; }
+      }
+      mstDeg[0] = 2; mstDeg[j1]++; mstDeg[j2]++;
+      return total + e1 + e2;
+    }
+
+    let rootLB = 0;
+    {
+      const lam = new Float64Array(N);
+      let step = 1.0, since = 0;
+      for (let iter = 0; iter < 300 && step > 1e-4; iter++) {
+        const w = oneTreeWithDegrees(lam);
+        let sum = 0;
+        for (let i = 0; i < N; i++) sum += lam[i];
+        const lb = w - 2 * sum;
+        if (lb > rootLB + 1e-9) { rootLB = lb; lambda.set(lam); since = 0; }
+        else if (++since >= 20) { step /= 2; since = 0; }
+        let norm = 0;
+        for (let i = 0; i < N; i++) { const g = mstDeg[i] - 2; norm += g * g; }
+        if (norm === 0) break; // MST 已是哈密顿环，下界达到最优
+        const t = step * Math.max(best - lb, 1e-9) / norm;
+        for (let i = 0; i < N; i++) lam[i] += t * (mstDeg[i] - 2);
+      }
+    }
+
+    // 剩余路程下界：cur →(经所有未访问点)→ 0 的惩罚路径中，
+    // 未访问点度数为 2、两端点度数为 1，故
+    // 真实剩余 ≥ MST'(cur ∪ 未访问 ∪ 0) − 2Σ_未访问 λ − λ_cur − λ_0
+    let sumLam = 0;
+    for (let j = 1; j < N; j++) sumLam += lambda[j];
     const nodes = new Int32Array(N + 1);
     const minE = new Float64Array(N + 1);
     const inTree = new Uint8Array(N + 1);
@@ -590,17 +653,16 @@ function solverWorkerMain() {
         for (let i = 0; i < k; i++) if (!inTree[i] && minE[i] < m) { m = minE[i]; u = i; }
         inTree[u] = 1;
         total += m;
-        const row = nodes[u] * N;
+        const nu = nodes[u], row = nu * N;
         for (let i = 0; i < k; i++) {
           if (inTree[i]) continue;
-          const w = D[row + nodes[i]];
+          const ni = nodes[i];
+          const w = D[row + ni] + lambda[nu] + lambda[ni];
           if (w < minE[i]) minE[i] = w;
         }
       }
-      return total;
+      return total - (2 * sumLam + lambda[cur] + lambda[0]);
     }
-
-    const rootLB = lowerBound(0);
 
     // 预先把每个点的邻居按距离排好，DFS 中按近到远直接扫，免去每个节点的排序和分配
     const nbr = new Int32Array(N * (N - 1));
@@ -612,6 +674,7 @@ function solverWorkerMain() {
       }
     }
 
+    let proven = false; // 上界一旦触到下界即可提前收工
     function dfs(cur, depth, cost) {
       explored++;
       if ((explored & 0x3FFFF) === 0) postMessage({ type: "tick", explored, lb: rootLB });
@@ -621,22 +684,25 @@ function solverWorkerMain() {
           best = total;
           resOrder = toResult(Array.from(path));
           report("better");
+          if (best <= rootLB + 1e-6) proven = true;
         }
         return;
       }
       const row = cur * N, nbrBase = cur * (N - 1);
-      for (let t = 0; t < N - 1; t++) {
+      for (let t = 0; t < N - 1 && !proven; t++) {
         const j = nbr[nbrBase + t];
         if (used[j]) continue;
         const c = cost + D[row + j];
         if (c >= best) continue;
         used[j] = 1;
+        sumLam -= lambda[j];
         path[depth] = j;
         if (c + lowerBound(j) < best - 1e-9) dfs(j, depth + 1, c);
         used[j] = 0;
+        sumLam += lambda[j];
       }
     }
-    dfs(0, 1, 0);
+    if (best > rootLB + 1e-6) dfs(0, 1, 0);
     report("done");
   }
 
