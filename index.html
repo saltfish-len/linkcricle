@@ -72,6 +72,15 @@
   .row label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
   .row label output { color: var(--text); font-variant-numeric: tabular-nums; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
+  select {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    background: var(--card);
+    color: var(--text);
+  }
   .check { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
   .check input { accent-color: var(--accent); }
   button {
@@ -98,7 +107,7 @@
 <body>
 <header>
   <h1>Link<span>Circle</span></h1>
-  <p>上传圆点图 → 自动识别每个圆 → 计算遍历全部圆的最短路径（最近邻 + 2-opt 近似 TSP）</p>
+  <p>上传圆点图 → 自动识别每个圆 → 计算遍历全部圆的最短路径（TSP：贪心近似 / 动态规划精确解）</p>
 </header>
 <main>
   <div id="stage">
@@ -119,6 +128,13 @@
       <div class="row">
         <label>最小圆面积（像素）<output id="minAreaVal">40</output></label>
         <input type="range" id="minArea" min="5" max="500" value="40">
+      </div>
+      <div class="row">
+        <label>求解算法</label>
+        <select id="algo">
+          <option value="approx">快速近似（最近邻 + 2-opt）</option>
+          <option value="exact">精确最优（Held-Karp 动态规划，≤ 20 个圆）</option>
+        </select>
       </div>
       <div class="row">
         <label class="check"><input type="checkbox" id="closed"> 闭环路径（走完回到起点）</label>
@@ -200,11 +216,22 @@ for (const id of ["threshold", "minArea"]) {
   input.oninput = () => { out.textContent = input.value; if (sourceImage) run(); };
 }
 document.getElementById("closed").onchange = () => { if (sourceImage) run(); };
+document.getElementById("algo").onchange = () => { if (sourceImage) run(); };
 document.getElementById("showLabels").onchange = () => { if (sourceImage) render(order.length, false); };
 
 // ---------- 主流程 ----------
 
+const MAX_EXACT = 20; // Held-Karp 是 O(n²·2ⁿ)，超过 20 个圆内存和耗时都不可行
+
+let runTimer = 0;
 function run() {
+  // 先让"计算中"渲染出来，再做重计算；同时给滑杆拖动做防抖
+  statsEl.innerHTML = '<span class="dim">计算中…</span>';
+  clearTimeout(runTimer);
+  runTimer = setTimeout(doRun, 30);
+}
+
+function doRun() {
   const t0 = performance.now();
   ctx.drawImage(sourceImage, 0, 0);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -216,24 +243,34 @@ function run() {
   );
 
   const closed = document.getElementById("closed").checked;
-  ({ order, length: pathLength } = solveTSP(circles, closed));
+  const wantExact = document.getElementById("algo").value === "exact";
+  const useExact = wantExact && circles.length <= MAX_EXACT;
+  ({ order, length: pathLength } = useExact
+    ? solveTSPExact(circles, closed)
+    : solveTSPApprox(circles, closed));
 
   const elapsed = performance.now() - t0;
-  updateStats(elapsed);
+  updateStats(elapsed, useExact, wantExact && !useExact);
   downloadBtn.disabled = circles.length === 0;
   animatePath();
 }
 
-function updateStats(elapsedMs) {
+function updateStats(elapsedMs, usedExact, fellBack) {
   if (circles.length === 0) {
     statsEl.innerHTML = '<span class="dim">没有识别到圆，试着调高灵敏度或调低最小面积</span>';
     return;
   }
+  const algoNote = usedExact
+    ? '精确最优解（Held-Karp 动态规划）'
+    : 'TSP 是 NP-hard，这里用最近邻 + 2-opt 求近似最优解';
+  const fallbackNote = fellBack
+    ? `<br><span class="dim">圆超过 ${MAX_EXACT} 个，精确算法不可行，已自动改用快速近似</span>`
+    : '';
   statsEl.innerHTML =
     `识别到圆：<b>${circles.length}</b> 个<br>` +
     `路径总长：<b>${Math.round(pathLength)}</b> px<br>` +
     `计算耗时：<b>${elapsedMs.toFixed(0)}</b> ms<br>` +
-    `<span class="dim">TSP 是 NP-hard，这里用最近邻 + 2-opt 求近似最优解</span>`;
+    `<span class="dim">${algoNote}</span>` + fallbackNote;
 }
 
 // ---------- 圆识别：背景色估计 → 前景掩码 → 连通域 → 圆心/半径 ----------
@@ -304,14 +341,10 @@ function detectCircles(imageData, threshold, minArea) {
   return result;
 }
 
-// ---------- TSP 近似：每个起点跑最近邻，取最优，再做 2-opt 优化 ----------
+// ---------- TSP 求解 ----------
 
-function solveTSP(points, closed) {
+function buildDist(points) {
   const n = points.length;
-  if (n === 0) return { order: [], length: 0 };
-  if (n === 1) return { order: [0], length: 0 };
-
-  // 距离矩阵
   const dist = new Float64Array(n * n);
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
@@ -320,13 +353,23 @@ function solveTSP(points, closed) {
       dist[j * n + i] = d;
     }
   }
+  return dist;
+}
 
-  const tourLength = (ord) => {
-    let len = 0;
-    for (let i = 1; i < ord.length; i++) len += dist[ord[i - 1] * n + ord[i]];
-    if (closed) len += dist[ord[ord.length - 1] * n + ord[0]];
-    return len;
-  };
+function tourLength(dist, n, ord, closed) {
+  let len = 0;
+  for (let i = 1; i < ord.length; i++) len += dist[ord[i - 1] * n + ord[i]];
+  if (closed) len += dist[ord[ord.length - 1] * n + ord[0]];
+  return len;
+}
+
+// 近似解：每个起点跑最近邻，取最优，再做 2-opt 优化
+function solveTSPApprox(points, closed) {
+  const n = points.length;
+  if (n === 0) return { order: [], length: 0 };
+  if (n === 1) return { order: [0], length: 0 };
+
+  const dist = buildDist(points);
 
   // 最近邻：n 较小时尝试所有起点，较大时只试一部分，控制在 O(n^3) 以内
   const starts = [];
@@ -379,7 +422,58 @@ function solveTSP(points, closed) {
     }
   }
 
-  return { order: ord, length: tourLength(ord) };
+  return { order: ord, length: tourLength(dist, n, ord, closed) };
+}
+
+// 精确解：Held-Karp 动态规划，O(n²·2ⁿ)，dp[mask][j] = 访问完 mask 中的点、停在 j 的最短长度
+function solveTSPExact(points, closed) {
+  const n = points.length;
+  if (n === 0) return { order: [], length: 0 };
+  if (n === 1) return { order: [0], length: 0 };
+
+  const dist = buildDist(points);
+  const full = (1 << n) - 1;
+  const dp = new Float32Array((1 << n) * n).fill(Infinity);
+  const parent = new Int8Array((1 << n) * n).fill(-1);
+
+  // 闭环时路径起点可任取，固定为 0 号点；开放路径起点未知，每个点都可作起点
+  if (closed) dp[1 * n + 0] = 0;
+  else for (let j = 0; j < n; j++) dp[(1 << j) * n + j] = 0;
+
+  for (let mask = 1; mask < full; mask++) {
+    const base = mask * n;
+    for (let j = 0; j < n; j++) {
+      const cur = dp[base + j];
+      if (cur === Infinity) continue;
+      const row = j * n;
+      for (let k = 0; k < n; k++) {
+        if (mask & (1 << k)) continue;
+        const cand = cur + dist[row + k];
+        const idx = (mask | (1 << k)) * n + k;
+        if (cand < dp[idx]) { dp[idx] = cand; parent[idx] = j; }
+      }
+    }
+  }
+
+  // 终点：闭环取「回到 0 号点」总长最短的，开放路径取 dp 值最小的
+  let end = -1, best = Infinity;
+  for (let j = 0; j < n; j++) {
+    const v = dp[full * n + j] + (closed ? dist[j * n + 0] : 0);
+    if (v < best) { best = v; end = j; }
+  }
+
+  // 沿 parent 回溯出访问顺序
+  const ord = [];
+  let mask = full, j = end;
+  while (j >= 0) {
+    ord.push(j);
+    const p = parent[mask * n + j];
+    mask ^= 1 << j;
+    j = p;
+  }
+  ord.reverse();
+
+  return { order: ord, length: tourLength(dist, n, ord, closed) };
 }
 
 // ---------- 绘制与动画 ----------
@@ -467,7 +561,7 @@ document.getElementById("demoBtn").onclick = () => {
 
   const placed = [];
   let attempts = 0;
-  while (placed.length < 22 && attempts < 2000) {
+  while (placed.length < 18 && attempts < 2000) {
     attempts++;
     const r = 10 + Math.random() * 18;
     const x = r + 30 + Math.random() * (w - 2 * r - 60);
