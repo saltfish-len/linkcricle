@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinkCircle · 圆点遍历最短路径工具</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --accent: #ff2442;
+    --text: #222;
+    --muted: #888;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; }
+  header h1 span { color: var(--accent); }
+  header p { color: var(--muted); font-size: 13px; }
+  main {
+    display: flex;
+    gap: 16px;
+    padding: 16px 24px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  #stage {
+    flex: 1 1 600px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    min-height: 420px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+  }
+  #stage.dragover { outline: 3px dashed var(--accent); outline-offset: -10px; }
+  #dropHint { text-align: center; color: var(--muted); padding: 60px 20px; }
+  #dropHint strong { color: var(--text); font-size: 16px; display: block; margin-bottom: 8px; }
+  #canvas { max-width: 100%; height: auto; display: none; border-radius: 12px; }
+  aside {
+    flex: 0 0 300px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .card h2 { font-size: 14px; margin-bottom: 12px; }
+  .row { margin-bottom: 12px; }
+  .row:last-child { margin-bottom: 0; }
+  .row label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .row label output { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  .check input { accent-color: var(--accent); }
+  button {
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    background: #f0f1f3;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  button:last-child { margin-bottom: 0; }
+  button.primary { background: var(--accent); color: #fff; }
+  button:hover { filter: brightness(0.95); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #stats { font-size: 13px; line-height: 2; }
+  #stats b { font-variant-numeric: tabular-nums; }
+  #stats .dim { color: var(--muted); }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Link<span>Circle</span></h1>
+  <p>上传圆点图 → 自动识别每个圆 → 计算遍历全部圆的最短路径（最近邻 + 2-opt 近似 TSP）</p>
+</header>
+<main>
+  <div id="stage">
+    <div id="dropHint">
+      <strong>点击 / 拖拽 / 粘贴 图片到这里</strong>
+      支持白底（或纯色底）上的圆点图，例如截图里的蓝点图<br>
+      所有计算都在浏览器本地完成，图片不会上传到任何服务器
+    </div>
+    <canvas id="canvas"></canvas>
+  </div>
+  <aside>
+    <div class="card">
+      <h2>参数</h2>
+      <div class="row">
+        <label>识别灵敏度（与背景色差阈值）<output id="thresholdVal">60</output></label>
+        <input type="range" id="threshold" min="15" max="150" value="60">
+      </div>
+      <div class="row">
+        <label>最小圆面积（像素）<output id="minAreaVal">40</output></label>
+        <input type="range" id="minArea" min="5" max="500" value="40">
+      </div>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="closed"> 闭环路径（走完回到起点）</label>
+      </div>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="showLabels" checked> 显示访问顺序编号</label>
+      </div>
+    </div>
+    <div class="card">
+      <button class="primary" id="pickBtn">选择图片</button>
+      <button id="demoBtn">生成示例图试一试</button>
+      <button id="downloadBtn" disabled>下载结果图</button>
+      <input type="file" id="fileInput" accept="image/*">
+    </div>
+    <div class="card">
+      <h2>结果</h2>
+      <div id="stats"><span class="dim">还没有图片</span></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const stage = document.getElementById("stage");
+const dropHint = document.getElementById("dropHint");
+const statsEl = document.getElementById("stats");
+const fileInput = document.getElementById("fileInput");
+const downloadBtn = document.getElementById("downloadBtn");
+
+let sourceImage = null;   // 当前原图（Image 或 canvas）
+let circles = [];         // 识别出的圆 {x, y, r, area}
+let order = [];           // 访问顺序（circles 的下标）
+let pathLength = 0;
+let animToken = 0;        // 用于打断进行中的路径动画
+
+// ---------- 输入：选择 / 拖拽 / 粘贴 ----------
+
+document.getElementById("pickBtn").onclick = () => fileInput.click();
+stage.addEventListener("click", () => { if (!sourceImage) fileInput.click(); });
+fileInput.onchange = () => { if (fileInput.files[0]) loadFile(fileInput.files[0]); };
+
+stage.addEventListener("dragover", e => { e.preventDefault(); stage.classList.add("dragover"); });
+stage.addEventListener("dragleave", () => stage.classList.remove("dragover"));
+stage.addEventListener("drop", e => {
+  e.preventDefault();
+  stage.classList.remove("dragover");
+  const file = e.dataTransfer.files[0];
+  if (file && file.type.startsWith("image/")) loadFile(file);
+});
+window.addEventListener("paste", e => {
+  for (const item of e.clipboardData.items) {
+    if (item.type.startsWith("image/")) { loadFile(item.getAsFile()); break; }
+  }
+});
+
+function loadFile(file) {
+  const img = new Image();
+  img.onload = () => { URL.revokeObjectURL(img.src); setImage(img); };
+  img.src = URL.createObjectURL(file);
+}
+
+function setImage(img) {
+  sourceImage = img;
+  canvas.width = img.width;
+  canvas.height = img.height;
+  canvas.style.display = "block";
+  dropHint.style.display = "none";
+  run();
+}
+
+// ---------- 参数变化时重新计算 ----------
+
+for (const id of ["threshold", "minArea"]) {
+  const input = document.getElementById(id);
+  const out = document.getElementById(id + "Val");
+  input.oninput = () => { out.textContent = input.value; if (sourceImage) run(); };
+}
+document.getElementById("closed").onchange = () => { if (sourceImage) run(); };
+document.getElementById("showLabels").onchange = () => { if (sourceImage) render(order.length, false); };
+
+// ---------- 主流程 ----------
+
+function run() {
+  const t0 = performance.now();
+  ctx.drawImage(sourceImage, 0, 0);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  circles = detectCircles(
+    imageData,
+    Number(document.getElementById("threshold").value),
+    Number(document.getElementById("minArea").value)
+  );
+
+  const closed = document.getElementById("closed").checked;
+  ({ order, length: pathLength } = solveTSP(circles, closed));
+
+  const elapsed = performance.now() - t0;
+  updateStats(elapsed);
+  downloadBtn.disabled = circles.length === 0;
+  animatePath();
+}
+
+function updateStats(elapsedMs) {
+  if (circles.length === 0) {
+    statsEl.innerHTML = '<span class="dim">没有识别到圆，试着调高灵敏度或调低最小面积</span>';
+    return;
+  }
+  statsEl.innerHTML =
+    `识别到圆：<b>${circles.length}</b> 个<br>` +
+    `路径总长：<b>${Math.round(pathLength)}</b> px<br>` +
+    `计算耗时：<b>${elapsedMs.toFixed(0)}</b> ms<br>` +
+    `<span class="dim">TSP 是 NP-hard，这里用最近邻 + 2-opt 求近似最优解</span>`;
+}
+
+// ---------- 圆识别：背景色估计 → 前景掩码 → 连通域 → 圆心/半径 ----------
+
+function detectCircles(imageData, threshold, minArea) {
+  const { width: w, height: h, data } = imageData;
+
+  // 取四条边的像素估计背景色（圆点图通常是纯色背景）
+  let br = 0, bg = 0, bb = 0, n = 0;
+  const sampleBg = (x, y) => {
+    const i = (y * w + x) * 4;
+    br += data[i]; bg += data[i + 1]; bb += data[i + 2]; n++;
+  };
+  for (let x = 0; x < w; x += 2) { sampleBg(x, 0); sampleBg(x, h - 1); }
+  for (let y = 0; y < h; y += 2) { sampleBg(0, y); sampleBg(w - 1, y); }
+  br /= n; bg /= n; bb /= n;
+
+  // 与背景色差超过阈值的像素视为前景
+  const mask = new Uint8Array(w * h);
+  const t2 = threshold * threshold;
+  for (let p = 0, i = 0; p < w * h; p++, i += 4) {
+    const dr = data[i] - br, dg = data[i + 1] - bg, db = data[i + 2] - bb;
+    // 用各通道差的最大值的平方近似，对深色和彩色圆点都稳定
+    const d = Math.max(dr * dr, dg * dg, db * db);
+    if (d > t2) mask[p] = 1;
+  }
+
+  // 8 连通域标记（栈式洪泛填充，避免递归爆栈）
+  const result = [];
+  const stack = new Int32Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    if (mask[p] !== 1) continue;
+    let top = 0;
+    stack[top++] = p;
+    mask[p] = 2;
+    let area = 0, sx = 0, sy = 0;
+    let minX = w, maxX = 0, minY = h, maxY = 0;
+    while (top > 0) {
+      const q = stack[--top];
+      const x = q % w, y = (q / w) | 0;
+      area++; sx += x; sy += y;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const np = ny * w + nx;
+          if (mask[np] === 1) { mask[np] = 2; stack[top++] = np; }
+        }
+      }
+    }
+    if (area < minArea) continue;
+
+    // 形状过滤：宽高比和填充率，排除细长线条、文字等非圆形区域
+    const bw = maxX - minX + 1, bh2 = maxY - minY + 1;
+    const aspect = bw / bh2;
+    const extent = area / (bw * bh2); // 圆的理论填充率约 π/4 ≈ 0.785
+    if (aspect < 0.4 || aspect > 2.5 || extent < 0.45) continue;
+
+    result.push({
+      x: sx / area,
+      y: sy / area,
+      r: Math.sqrt(area / Math.PI),
+      area
+    });
+  }
+  return result;
+}
+
+// ---------- TSP 近似：每个起点跑最近邻，取最优，再做 2-opt 优化 ----------
+
+function solveTSP(points, closed) {
+  const n = points.length;
+  if (n === 0) return { order: [], length: 0 };
+  if (n === 1) return { order: [0], length: 0 };
+
+  // 距离矩阵
+  const dist = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const d = Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y);
+      dist[i * n + j] = d;
+      dist[j * n + i] = d;
+    }
+  }
+
+  const tourLength = (ord) => {
+    let len = 0;
+    for (let i = 1; i < ord.length; i++) len += dist[ord[i - 1] * n + ord[i]];
+    if (closed) len += dist[ord[ord.length - 1] * n + ord[0]];
+    return len;
+  };
+
+  // 最近邻：n 较小时尝试所有起点，较大时只试一部分，控制在 O(n^3) 以内
+  const starts = [];
+  const maxStarts = n <= 250 ? n : Math.max(1, Math.floor(250 * 250 / n));
+  for (let s = 0; s < n; s += Math.max(1, Math.floor(n / maxStarts))) starts.push(s);
+
+  let bestOrder = null, bestLen = Infinity;
+  const visited = new Uint8Array(n);
+  for (const s of starts) {
+    visited.fill(0);
+    const ord = [s];
+    visited[s] = 1;
+    let cur = s, len = 0;
+    for (let k = 1; k < n; k++) {
+      let next = -1, nd = Infinity;
+      const row = cur * n;
+      for (let j = 0; j < n; j++) {
+        if (!visited[j] && dist[row + j] < nd) { nd = dist[row + j]; next = j; }
+      }
+      ord.push(next);
+      visited[next] = 1;
+      len += nd;
+      cur = next;
+    }
+    if (closed) len += dist[cur * n + s];
+    if (len < bestLen) { bestLen = len; bestOrder = ord; }
+  }
+
+  // 2-opt：反转一段子路径，若总长变短则接受，循环到无改进或超时
+  const ord = bestOrder;
+  const deadline = performance.now() + 2000;
+  let improved = true;
+  while (improved && performance.now() < deadline) {
+    improved = false;
+    for (let i = 0; i < n - 1; i++) {
+      // 开放路径中 i=0 表示换起点（左侧没有边）；闭环时左邻是末尾节点
+      const a = i === 0 ? (closed ? ord[n - 1] : -1) : ord[i - 1];
+      for (let j = i + 1; j < n; j++) {
+        if (closed && i === 0 && j === n - 1) continue;
+        const b = j === n - 1 ? (closed ? ord[0] : -1) : ord[j + 1];
+        const before = (a >= 0 ? dist[a * n + ord[i]] : 0) + (b >= 0 ? dist[ord[j] * n + b] : 0);
+        const after  = (a >= 0 ? dist[a * n + ord[j]] : 0) + (b >= 0 ? dist[ord[i] * n + b] : 0);
+        if (after < before - 1e-9) {
+          for (let l = i, r = j; l < r; l++, r--) {
+            const tmp = ord[l]; ord[l] = ord[r]; ord[r] = tmp;
+          }
+          improved = true;
+        }
+      }
+    }
+  }
+
+  return { order: ord, length: tourLength(ord) };
+}
+
+// ---------- 绘制与动画 ----------
+
+function render(visibleSegments, animating) {
+  ctx.drawImage(sourceImage, 0, 0);
+  const showLabels = document.getElementById("showLabels").checked;
+  const closed = document.getElementById("closed").checked;
+  const scale = Math.max(1, canvas.width / 800); // 大图按比例加粗线条
+
+  // 路径
+  const pts = order.map(i => circles[i]);
+  const totalSegments = closed ? pts.length : pts.length - 1;
+  const segs = Math.min(visibleSegments, totalSegments);
+  if (pts.length > 1 && segs > 0) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i <= segs; i++) {
+      const p = pts[i % pts.length];
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = "rgba(255, 36, 66, 0.9)";
+    ctx.lineWidth = 2.5 * scale;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+  }
+
+  // 圆的标记
+  for (let k = 0; k < pts.length; k++) {
+    const p = pts[k];
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r + 2 * scale, 0, Math.PI * 2);
+    ctx.strokeStyle = k === 0 ? "#16a34a" : "rgba(255, 36, 66, 0.8)";
+    ctx.lineWidth = 2 * scale;
+    ctx.stroke();
+
+    if (showLabels && !animating) {
+      const fontSize = Math.max(11, 12 * scale);
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      const label = String(k + 1);
+      const tw = ctx.measureText(label).width;
+      const lx = p.x + p.r + 4 * scale, ly = p.y - p.r - 4 * scale;
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillRect(lx - 2, ly - fontSize, tw + 4, fontSize + 4);
+      ctx.fillStyle = "#ff2442";
+      ctx.fillText(label, lx, ly);
+    }
+  }
+}
+
+function animatePath() {
+  const token = ++animToken;
+  const closed = document.getElementById("closed").checked;
+  const totalSegments = closed ? order.length : order.length - 1;
+  if (totalSegments <= 0) { render(0, false); return; }
+  // 路径越长画得越快，整体控制在 1.5 秒左右
+  const msPerSegment = Math.min(80, 1500 / totalSegments);
+  let seg = 0;
+  let last = performance.now();
+  const step = (now) => {
+    if (token !== animToken) return; // 有新计算，放弃旧动画
+    seg += (now - last) / msPerSegment;
+    last = now;
+    if (seg >= totalSegments) {
+      render(totalSegments, false);
+      return;
+    }
+    render(Math.floor(seg), true);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---------- 示例图生成 ----------
+
+document.getElementById("demoBtn").onclick = () => {
+  const w = 960, h = 600;
+  const off = document.createElement("canvas");
+  off.width = w; off.height = h;
+  const octx = off.getContext("2d");
+  octx.fillStyle = "#ffffff";
+  octx.fillRect(0, 0, w, h);
+  octx.fillStyle = "#5b9bd5";
+
+  const placed = [];
+  let attempts = 0;
+  while (placed.length < 22 && attempts < 2000) {
+    attempts++;
+    const r = 10 + Math.random() * 18;
+    const x = r + 30 + Math.random() * (w - 2 * r - 60);
+    const y = r + 30 + Math.random() * (h - 2 * r - 60);
+    if (placed.some(c => Math.hypot(c.x - x, c.y - y) < c.r + r + 12)) continue;
+    placed.push({ x, y, r });
+    octx.beginPath();
+    octx.arc(x, y, r, 0, Math.PI * 2);
+    octx.fill();
+  }
+  setImage(off);
+};
+
+// ---------- 下载结果 ----------
+
+downloadBtn.onclick = () => {
+  const a = document.createElement("a");
+  a.download = "linkcircle-result.png";
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+};
+</script>
+</body>
+</html>
